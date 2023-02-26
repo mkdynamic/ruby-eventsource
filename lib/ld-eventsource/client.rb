@@ -85,19 +85,23 @@ module SSE
     #   if you want to use something other than the default `TCPSocket`; it must implement
     #   `open(uri, timeout)` to return a connected `Socket`
     # @yieldparam [Client] client  the new client instance, before opening the connection
-    # 
-    def initialize(uri,
-          headers: {},
-          connect_timeout: DEFAULT_CONNECT_TIMEOUT,
-          read_timeout: DEFAULT_READ_TIMEOUT,
-          reconnect_time: DEFAULT_RECONNECT_TIME,
-          reconnect_reset_interval: DEFAULT_RECONNECT_RESET_INTERVAL,
-          last_event_id: nil,
-          proxy: nil,
-          logger: nil,
-          socket_factory: nil)
+    #
+    def initialize(
+      uri,
+      headers: {},
+      connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+      read_timeout: DEFAULT_READ_TIMEOUT,
+      reconnect_time: DEFAULT_RECONNECT_TIME,
+      reconnect_reset_interval: DEFAULT_RECONNECT_RESET_INTERVAL,
+      last_event_id: nil,
+      proxy: nil,
+      logger: nil,
+      socket_factory: nil,
+      body: nil
+    )
       @uri = URI(uri)
       @stopped = Concurrent::AtomicBoolean.new(false)
+      @body = body
 
       @headers = headers.clone
       @connect_timeout = connect_timeout
@@ -107,12 +111,12 @@ module SSE
       if socket_factory
         http_client_options["socket_class"] = socket_factory
       end
-      
+
       if proxy
         @proxy = proxy
       else
         proxy_uri = @uri.find_proxy
-        if !proxy_uri.nil? && (proxy_uri.scheme == 'http' || proxy_uri.scheme == 'https')
+        if !proxy_uri.nil? && (proxy_uri.scheme == "http" || proxy_uri.scheme == "https")
           @proxy = proxy_uri
         end
       end
@@ -124,19 +128,25 @@ module SSE
         }
       end
 
-      @http_client = HTTP::Client.new(http_client_options)
-        .timeout({
-          read: read_timeout,
-          connect: connect_timeout
-        })
+      @http_client = HTTP::Client
+        .new(http_client_options)
+        .timeout(
+          {
+            read: read_timeout,
+            connect: connect_timeout
+          }
+        )
       @cxn = nil
       @lock = Mutex.new
 
-      @backoff = Impl::Backoff.new(reconnect_time || DEFAULT_RECONNECT_TIME, MAX_RECONNECT_TIME,
-        reconnect_reset_interval: reconnect_reset_interval)
+      @backoff = Impl::Backoff.new(
+        reconnect_time || DEFAULT_RECONNECT_TIME,
+        MAX_RECONNECT_TIME,
+        reconnect_reset_interval: reconnect_reset_interval
+      )
       @first_attempt = true
 
-      @on = { event: ->(_) {}, error: ->(_) {} }
+      @on = {event: -> (_) {  }, error: -> (_) {  }}
       @last_id = last_event_id
 
       yield self if block_given?
@@ -202,12 +212,12 @@ module SSE
     end
 
     private
-    
+
     def reset_http
       @http_client.close if !@http_client.nil?
       close_connection
     end
-    
+
     def close_connection
       @lock.synchronize do
         @cxn.connection.close if !@cxn.nil?
@@ -218,7 +228,7 @@ module SSE
     def default_logger
       log = ::Logger.new($stdout)
       log.level = ::Logger::WARN
-      log.progname  = 'ld-eventsource'
+      log.progname = "ld-eventsource"
       log
     end
 
@@ -243,6 +253,7 @@ module SSE
             log_and_dispatch_error(e, "Unexpected error from event source")
           end
         end
+
         begin
           reset_http
         rescue StandardError => e
@@ -258,19 +269,26 @@ module SSE
         interval = @first_attempt ? 0 : @backoff.next_interval
         @first_attempt = false
         if interval > 0
-          @logger.info { "Will retry connection after #{'%.3f' % interval} seconds" } 
+          @logger.info { "Will retry connection after #{"%.3f" % interval} seconds" }
           sleep(interval)
         end
+
         cxn = nil
         begin
           @logger.info { "Connecting to event stream at #{@uri}" }
-          cxn = @http_client.request("GET", @uri, {
-            headers: build_headers
-          })
+          cxn = @http_client.request(
+            "POST",
+            @uri,
+            {
+              headers: build_headers,
+              body: @body
+            }
+          )
           if cxn.status.code == 200
             content_type = cxn.headers["content-type"]
             if content_type && content_type.start_with?("text/event-stream")
-              return cxn  # we're good to proceed
+              # we're good to proceed
+              return cxn
             else
               reset_http
               err = Errors::HTTPContentTypeError.new(cxn.headers["content-type"])
@@ -278,15 +296,18 @@ module SSE
               @logger.warn { "Event source returned unexpected content type '#{cxn.headers["content-type"]}'" }
             end
           else
-            body = cxn.to_s  # grab the whole response body in case it has error details
+            # grab the whole response body in case it has error details
+            body = cxn.to_s
             reset_http
             @logger.info { "Server returned error status #{cxn.status.code}" }
             err = Errors::HTTPStatusError.new(cxn.status.code, body)
             @on[:error].call(err)
           end
+
         rescue
           reset_http
-          raise  # will be handled in run_stream
+          # will be handled in run_stream
+          raise
         end
         # if unsuccessful, continue the loop to connect again
       end
@@ -309,25 +330,27 @@ module SSE
               # readpartial gives us a string, which may not be a valid UTF-8 string because a
               # multi-byte character might not yet have been fully read, but BufferedLineReader
               # will handle that.
-            rescue HTTP::TimeoutError 
+            rescue HTTP::TimeoutError
               # For historical reasons, we rethrow this as our own type
               raise Errors::ReadTimeoutError.new(@read_timeout)
             end
+
             break if data.nil?
             gen.yield data
           end
         end
       end
+
       event_parser = Impl::EventParser.new(Impl::BufferedLineReader.lines_from(chunks), @last_id)
 
       event_parser.items.each do |item|
         return if @stopped.value
         case item
-          when StreamEvent
-            dispatch_event(item)
-          when Impl::SetRetryInterval
-            @logger.debug { "Received 'retry:' directive, setting interval to #{item.milliseconds}ms" }
-            @backoff.base_interval = item.milliseconds.to_f / 1000
+        when StreamEvent
+          dispatch_event(item)
+        when Impl::SetRetryInterval
+          @logger.debug { "Received 'retry:' directive, setting interval to #{item.milliseconds}ms" }
+          @backoff.base_interval = item.milliseconds.to_f / 1000
         end
       end
     end
@@ -341,23 +364,23 @@ module SSE
     end
 
     def log_and_dispatch_error(e, message)
-      @logger.warn { "#{message}: #{e.inspect}"}
+      @logger.warn { "#{message}: #{e.inspect}" }
       @logger.debug { "Exception trace: #{e.backtrace}" }
       begin
-        @on[:error].call(e)      
+        @on[:error].call(e)
       rescue StandardError => ee
-        @logger.warn { "Error handler threw an exception: #{ee.inspect}"}
+        @logger.warn { "Error handler threw an exception: #{ee.inspect}" }
         @logger.debug { "Exception trace: #{ee.backtrace}" }
       end
     end
 
     def build_headers
       h = {
-        'Accept' => 'text/event-stream',
-        'Cache-Control' => 'no-cache',
-        'User-Agent' => 'ruby-eventsource'
+        "Accept" => "text/event-stream",
+        "Cache-Control" => "no-cache",
+        "User-Agent" => "ruby-eventsource"
       }
-      h['Last-Event-Id'] = @last_id if !@last_id.nil? && @last_id != ""
+      h["Last-Event-Id"] = @last_id if !@last_id.nil? && @last_id != ""
       h.merge(@headers)
     end
   end
